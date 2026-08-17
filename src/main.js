@@ -2,6 +2,50 @@ import "./style.css";
 import * as THREE from "three";
 
 /* ------------------------------------------------------------------ */
+/*  LOADER — stays up until every asset is in and the scene has drawn   */
+/* ------------------------------------------------------------------ */
+const loaderEl = document.getElementById("loader");
+const loaderPct = document.getElementById("loader-pct");
+document.body.classList.add("loading");
+
+const assets = []; // promises the loader waits on
+let loadedCount = 0; // how many of them have finished
+let shownPct = 0; // eased percentage, so the number counts up smoothly
+let ready = false; // true once the loader is gone and input is live
+
+const nextFrame = () => new Promise(requestAnimationFrame);
+
+// wait on a promise and count it toward the percentage — a failed asset
+// still counts, so one dead URL can never wedge the loader shut
+function load(promise) {
+  const p = Promise.resolve(promise).catch(() => {});
+  assets.push(p);
+  p.then(() => loadedCount++);
+  return p;
+}
+
+// runs every frame: ease the displayed number toward the real progress
+function updateLoader(dt) {
+  if (ready) return;
+  const target = (loadedCount / assets.length) * 100;
+  shownPct += (target - shownPct) * Math.min(dt * 5, 1);
+  loaderPct.textContent = `${Math.floor(shownPct)}%`;
+}
+
+async function hideLoader() {
+  await Promise.all(assets);
+  while (shownPct < 99.5) await nextFrame(); // let the number finish counting
+  loaderPct.textContent = "100%";
+
+  ready = true;
+  document.body.classList.remove("loading");
+  loaderEl.classList.add("done");
+  loaderEl.addEventListener("transitionend", () => loaderEl.remove(), {
+    once: true,
+  });
+}
+
+/* ------------------------------------------------------------------ */
 /*  CONFIG                                                             */
 /* ------------------------------------------------------------------ */
 const CFG = {
@@ -148,31 +192,37 @@ function drawPanel(idx, img) {
 
 const photoCache = []; // idx -> Image (loaded) | "loading"
 
+// resolves once the panel's photo is drawn (or has definitively failed)
 function ensurePhoto(idx) {
-  if (photoCache[idx]) return;
+  if (photoCache[idx]) return Promise.resolve();
   photoCache[idx] = "loading";
   const id = UNSPLASH_IDS[idx % UNSPLASH_IDS.length];
-  const img = new Image();
-  img.crossOrigin = "anonymous";
-  img.onload = () => {
-    photoCache[idx] = img;
-    drawPanel(idx, img);
-    stripTexture.needsUpdate = true;
-  };
-  // if an Unsplash id is dead, fall back to a Picsum photo so the
-  // panel never stays a blank placeholder
-  img.onerror = () => {
-    img.onerror = null;
-    img.src = `https://picsum.photos/seed/roll-${idx}/900/600`;
-  };
-  img.src = `https://images.unsplash.com/${id}?w=900&q=80&fm=jpg&fit=crop`;
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    img.onload = () => {
+      photoCache[idx] = img;
+      drawPanel(idx, img);
+      stripTexture.needsUpdate = true;
+      resolve();
+    };
+    // if an Unsplash id is dead, fall back to a Picsum photo so the
+    // panel never stays a blank placeholder
+    img.onerror = () => {
+      img.onerror = () => resolve(); // fallback failed too — don't block
+      img.src = `https://picsum.photos/seed/roll-${idx}/900/600`;
+    };
+    img.src = `https://images.unsplash.com/${id}?w=900&q=80&fm=jpg&fit=crop`;
+  });
 }
 
 for (let i = 0; i < CFG.panels; i++) {
   drawPanel(i, null);
-  ensurePhoto(i);
+  load(ensurePhoto(i));
 }
 stripTexture.needsUpdate = true;
+
+load(document.fonts.ready); // the on-screen type waits on the web fonts too
 
 /* ------------------------------------------------------------------ */
 /*  PATH — the trail the roll leaves behind as the user steers it      */
@@ -526,6 +576,7 @@ function pointerToGround(clientX, clientY, out) {
 
 const canvas = renderer.domElement;
 canvas.addEventListener("pointerdown", (e) => {
+  if (!ready) return; // no steering until the loader is gone
   dragging = true;
   seekValid = !!pointerToGround(e.clientX, e.clientY, seekPoint);
   canvas.classList.add("dragging");
@@ -577,6 +628,7 @@ updateCamera();
 function tick() {
   requestAnimationFrame(tick);
   const dt = Math.min(clock.getDelta(), 0.05);
+  updateLoader(dt);
 
   // the roll chases the pointer while dragging: speed scales with how far
   // the pointer is (drag farther = roll faster)
@@ -621,6 +673,7 @@ function tick() {
   renderer.render(scene, camera);
 }
 tick();
+hideLoader();
 
 /* ------------------------------------------------------------------ */
 /*  RESIZE                                                             */
