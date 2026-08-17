@@ -1,42 +1,42 @@
 import "./style.css";
 import * as THREE from "three";
-import GUI from "three/examples/jsm/libs/lil-gui.module.min.js";
 
 /* ------------------------------------------------------------------ */
-/*  CONFIG (everything here is editable from the GUI)                  */
+/*  CONFIG                                                             */
 /* ------------------------------------------------------------------ */
 const CFG = {
   // roll / strip
-  L: 300, // total strip length (world units)
+  L: 900, // total strip length (world units)
   W: 7, // strip width = length of the roll cylinder
   core: 0.8, // core tube radius
-  h: 0.055, // paper thickness per wrap
-  panels: 28, // number of gallery panels on the strip
+  h: 0.01, // paper thickness per wrap
+  panels: 30, // number of distinct photos in the texture atlas
+  panelScale: 1, // photo length along the strip (1 = undistorted aspect)
   lift: 0.012, // strip height above the ground
   // motion
-  follow: 4.0, // chase strength — speed scales with distance to the pointer
-  maxSpeed: 24, // speed cap (units / second)
-  maxTurn: 1.6, // steering rate: radians per unit of strip rolled out
+  follow: 4, // chase strength — speed scales with distance to the pointer
+  maxSpeed: 26, // speed cap (units / second)
+  maxTurn: 1.1, // steering rate: radians per unit of strip rolled out
   deadzone: 1.1, // roll stops when it gets this close to the pointer
+  accel: 11.7, // how hard it picks up speed
+  drag: 0.9, // how slowly it bleeds speed — low = long slippery glide
+  steer: 12.5, // heading response to the pointer
   // camera
   camX: -4.5,
-  camY: 9.5,
+  camY: 12,
   camZ: 13.5,
   fov: 65,
 };
 
-const SEGS = 1400; // segments along strip length
+const SEGS = 3200; // segments along strip length
 const WSEGS = 6; // segments across width
 const STEP = 0.05; // arc-length between path samples
-const MAX_L = 300; // upper bound for the GUI length slider
-const RAMP = 0.0015; // height gain per unit laid, so later tape stacks on top
+const RAMP = 0.0005; // height gain per unit laid, so later tape stacks on top
 const TWO_PI = Math.PI * 2;
-
-const PALETTE = ["#e8380d", "#141414", "#f4f1ea", "#f5b80c"];
 
 const outerRadius = (remaining) =>
   Math.sqrt(CFG.core * CFG.core + (CFG.h * remaining) / Math.PI);
-let R_FULL = outerRadius(CFG.L);
+const R_FULL = outerRadius(CFG.L);
 
 /* ------------------------------------------------------------------ */
 /*  RENDERER / SCENE / CAMERA                                          */
@@ -73,7 +73,7 @@ ground.rotation.x = -Math.PI / 2;
 scene.add(ground);
 
 /* ------------------------------------------------------------------ */
-/*  STRIP TEXTURE (procedural posters + lazy photos)                   */
+/*  STRIP TEXTURE (photo atlas, drawn once and lazily filled)          */
 /* ------------------------------------------------------------------ */
 // as much texture width as this GPU allows (some max out at 8192)
 const TEX_W = Math.min(16384, renderer.capabilities.maxTextureSize);
@@ -85,6 +85,9 @@ const tctx = texCanvas.getContext("2d");
 
 const stripTexture = new THREE.CanvasTexture(texCanvas);
 stripTexture.colorSpace = THREE.SRGBColorSpace;
+// the atlas tiles along the strip, so photos keep a fixed world size
+stripTexture.wrapS = THREE.RepeatWrapping;
+stripTexture.wrapT = THREE.ClampToEdgeWrapping;
 stripTexture.anisotropy = renderer.capabilities.getMaxAnisotropy();
 
 function coverDraw(ctx, img, x, y, w, h) {
@@ -153,10 +156,8 @@ function ensurePhoto(idx) {
   img.crossOrigin = "anonymous";
   img.onload = () => {
     photoCache[idx] = img;
-    if (idx < CFG.panels) {
-      drawPanel(idx, img);
-      stripTexture.needsUpdate = true;
-    }
+    drawPanel(idx, img);
+    stripTexture.needsUpdate = true;
   };
   // if an Unsplash id is dead, fall back to a Picsum photo so the
   // panel never stays a blank placeholder
@@ -167,21 +168,17 @@ function ensurePhoto(idx) {
   img.src = `https://images.unsplash.com/${id}?w=900&q=80&fm=jpg&fit=crop`;
 }
 
-function redrawTexture() {
-  for (let i = 0; i < CFG.panels; i++) {
-    const cached = photoCache[i];
-    drawPanel(i, cached instanceof Image ? cached : null);
-    ensurePhoto(i);
-  }
-  stripTexture.needsUpdate = true;
+for (let i = 0; i < CFG.panels; i++) {
+  drawPanel(i, null);
+  ensurePhoto(i);
 }
-redrawTexture();
+stripTexture.needsUpdate = true;
 
 /* ------------------------------------------------------------------ */
 /*  PATH — the trail the roll leaves behind as the user steers it      */
 /* ------------------------------------------------------------------ */
 // samples: [x, z, tx, tz] per point, laid down once and then frozen
-const samples = new Float32Array((Math.ceil(MAX_L / STEP) + 2) * 4);
+const samples = new Float32Array((Math.ceil(CFG.L / STEP) + 2) * 4);
 let sampleCount = 0;
 let pathLen = 0; // arc length covered by committed samples
 
@@ -205,11 +202,10 @@ const shortAngle = (a) => Math.atan2(Math.sin(a), Math.cos(a));
 function advancePath(sNew) {
   // tight turns fan the tape over itself like a real ribbon — the height
   // ramp keeps the newest layer on top, so it renders cleanly
-  const kMax = CFG.maxTurn;
+  const lim = CFG.maxTurn * STEP;
   while (pathLen + STEP <= sNew) {
     const diff = shortAngle(desiredTheta - theta);
-    const eased = diff * 0.5; // quick response, gentle ease-out tail
-    const lim = kMax * STEP;
+    const eased = diff * 0.22; // slides into the turn instead of snapping
     theta += Math.min(Math.max(eased, -lim), lim);
     headX += Math.cos(theta) * STEP;
     headZ += Math.sin(theta) * STEP;
@@ -250,13 +246,6 @@ const stripGeo = new THREE.BufferGeometry();
   const pos = new Float32Array(rows * cols * 3);
   const uv = new Float32Array(rows * cols * 2);
   const idx = [];
-  for (let i = 0; i < rows; i++) {
-    for (let j = 0; j < cols; j++) {
-      const k = i * cols + j;
-      uv[k * 2] = i / SEGS;
-      uv[k * 2 + 1] = j / WSEGS;
-    }
-  }
   for (let i = 0; i < SEGS; i++) {
     for (let j = 0; j < WSEGS; j++) {
       const a = i * cols + j;
@@ -281,9 +270,29 @@ const strip = new THREE.Mesh(
 strip.frustumCulled = false;
 world.add(strip);
 
+/* Photo size along the strip is fixed in world units instead of being
+   L / panels — otherwise a longer strip just stretches every photo.
+   One photo occupies `panelLen` units and the atlas repeats down the
+   strip as many times as needed. */
+{
+  // the un-stretched length of one photo, from the atlas cell's aspect
+  const cellAspect = TEX_W / CFG.panels / TEX_H;
+  const panelLen = CFG.W * cellAspect * CFG.panelScale;
+  const repeats = CFG.L / (panelLen * CFG.panels);
+  const uv = stripGeo.attributes.uv.array;
+  for (let i = 0; i < rows; i++) {
+    const u = (i / SEGS) * repeats;
+    for (let j = 0; j < cols; j++) {
+      const k = i * cols + j;
+      uv[k * 2] = u;
+      uv[k * 2 + 1] = j / WSEGS;
+    }
+  }
+  stripGeo.attributes.uv.needsUpdate = true;
+}
+
 function updateStrip(s) {
-  const rem = CFG.L - s;
-  const R = outerRadius(Math.max(rem, 0));
+  const R = outerRadius(Math.max(CFG.L - s, 0));
   const pos = stripGeo.attributes.position.array;
   const halfW = CFG.W / 2;
 
@@ -425,42 +434,36 @@ function updateAnnulus(geo, rIn, rOut) {
 const rollGroup = new THREE.Group();
 world.add(rollGroup);
 
-const capTex = makeCapTexture();
 const capMat = new THREE.MeshStandardMaterial({
-  map: capTex,
+  map: makeCapTexture(),
   roughness: 0.95,
   side: THREE.DoubleSide,
 });
 const capL = new THREE.Mesh(makeAnnulus(120), capMat);
 const capR = new THREE.Mesh(makeAnnulus(120), capMat);
+capL.position.z = -CFG.W / 2 - 0.004;
+capR.position.z = CFG.W / 2 + 0.004;
 rollGroup.add(capL, capR);
 
 // tan cardboard core — stays behind when the tape runs out
-const coreMat = new THREE.MeshStandardMaterial({
-  color: 0xd9b896,
-  roughness: 1,
-  side: THREE.DoubleSide,
-});
-const core = new THREE.Mesh(undefined, coreMat);
+const coreGeo = new THREE.CylinderGeometry(
+  CFG.core * 0.97,
+  CFG.core * 0.97,
+  CFG.W * 1.005,
+  64,
+  1,
+  true,
+);
+coreGeo.rotateX(Math.PI / 2);
+const core = new THREE.Mesh(
+  coreGeo,
+  new THREE.MeshStandardMaterial({
+    color: 0xd9b896,
+    roughness: 1,
+    side: THREE.DoubleSide,
+  }),
+);
 rollGroup.add(core);
-
-// (re)build the geometry that depends on W / core size
-function buildRollParts() {
-  capL.position.z = -CFG.W / 2 - 0.004;
-  capR.position.z = CFG.W / 2 + 0.004;
-
-  if (core.geometry) core.geometry.dispose();
-  const cg = new THREE.CylinderGeometry(
-    CFG.core * 0.97,
-    CFG.core * 0.97,
-    CFG.W * 1.005,
-    64,
-    1,
-    true,
-  );
-  cg.rotateX(Math.PI / 2);
-  core.geometry = cg;
-}
 
 function updateRoll(s, R, ds) {
   const frac = s - pathLen;
@@ -479,6 +482,24 @@ function updateRoll(s, R, ds) {
   capL.rotation.z -= dAng;
   capR.rotation.z -= dAng;
 }
+
+/* ------------------------------------------------------------------ */
+/*  CURSOR BADGE + HINT                                                */
+/* ------------------------------------------------------------------ */
+const badge = document.createElement("div");
+badge.id = "cursor-badge";
+badge.innerHTML = `<div class="badge-inner">DRAG<br/>AND ROLL</div>`;
+document.body.appendChild(badge);
+
+const hint = document.createElement("div");
+hint.id = "progress-hint";
+hint.textContent = "DRAG TO UNROLL";
+document.body.appendChild(hint);
+
+let mouseX = window.innerWidth / 2;
+let mouseY = window.innerHeight / 2;
+let badgeX = mouseX;
+let badgeY = mouseY;
 
 /* ------------------------------------------------------------------ */
 /*  DRAG INPUT — steer anywhere, unroll only                           */
@@ -527,29 +548,11 @@ canvas.addEventListener("pointerup", endDrag);
 canvas.addEventListener("pointercancel", endDrag);
 
 /* ------------------------------------------------------------------ */
-/*  CURSOR BADGE + HINT                                                */
-/* ------------------------------------------------------------------ */
-const badge = document.createElement("div");
-badge.id = "cursor-badge";
-badge.innerHTML = `<div class="badge-inner">DRAG<br/>AND ROLL</div>`;
-document.body.appendChild(badge);
-
-const hint = document.createElement("div");
-hint.id = "progress-hint";
-hint.textContent = "DRAG TO UNROLL";
-document.body.appendChild(hint);
-
-let mouseX = window.innerWidth / 2;
-let mouseY = window.innerHeight / 2;
-let badgeX = mouseX;
-let badgeY = mouseY;
-
-/* ------------------------------------------------------------------ */
 /*  CAMERA FOLLOW                                                      */
 /* ------------------------------------------------------------------ */
 const camTarget = new THREE.Vector3(-2, 0.4, 0);
 const camDesired = new THREE.Vector3();
-const camOffset = new THREE.Vector3();
+const camOffset = new THREE.Vector3(CFG.camX, CFG.camY, CFG.camZ);
 
 function updateCamera() {
   camDesired.set(
@@ -558,133 +561,17 @@ function updateCamera() {
     headZ - Math.sin(theta) * 3.2,
   );
   camTarget.lerp(camDesired, 0.045);
-  camOffset.set(CFG.camX, CFG.camY, CFG.camZ);
   camera.position.copy(camTarget).add(camOffset);
   camera.lookAt(camTarget);
 }
 
 /* ------------------------------------------------------------------ */
-/*  RESET / REBUILD                                                    */
-/* ------------------------------------------------------------------ */
-let currentR = R_FULL;
-
-function resetRoll() {
-  s = S_MIN;
-  vel = 0;
-  sampleCount = 0;
-  pathLen = 0;
-  theta = 0;
-  desiredTheta = 0;
-  headX = 0;
-  headZ = 0;
-  pushSample(0, 0, 1, 0);
-  capL.rotation.z = 0;
-  capR.rotation.z = 0;
-  camTarget.set(-2, 0.4, 0);
-  hint.classList.remove("hidden");
-  currentR = updateStrip(s);
-  updateRoll(s, currentR, 0);
-}
-
-// call after changing L / W / core / h — the roll re-rolls from scratch
-function applyStructure() {
-  R_FULL = outerRadius(CFG.L);
-  buildRollParts();
-  resetRoll();
-}
-
-/* ------------------------------------------------------------------ */
-/*  GUI                                                                */
-/* ------------------------------------------------------------------ */
-const gui = new GUI({ title: "ROLL CONFIG" });
-
-const fRoll = gui.addFolder("Roll");
-fRoll
-  .add(CFG, "L", 10, MAX_L, 1)
-  .name("strip length")
-  .onFinishChange(applyStructure);
-fRoll
-  .add(CFG, "W", 1, 6, 0.1)
-  .name("roll width")
-  .onFinishChange(applyStructure);
-fRoll
-  .add(CFG, "core", 0.2, 1.5, 0.05)
-  .name("core radius")
-  .onFinishChange(applyStructure);
-fRoll
-  .add(CFG, "h", 0.02, 0.15, 0.005)
-  .name("paper thickness")
-  .onFinishChange(applyStructure);
-fRoll.add(CFG, "lift", 0.005, 0.05, 0.001).name("ground lift");
-
-const fMotion = gui.addFolder("Motion");
-fMotion.add(CFG, "follow", 0.5, 6, 0.1).name("follow strength");
-fMotion.add(CFG, "maxSpeed", 2, 30, 0.5).name("max speed");
-fMotion.add(CFG, "maxTurn", 0.2, 3, 0.05).name("turn rate");
-fMotion.add(CFG, "deadzone", 0.3, 3, 0.05).name("stop distance");
-
-const fPanels = gui.addFolder("Panels");
-fPanels
-  .add(CFG, "panels", 4, 30, 1)
-  .name("panel count")
-  .onFinishChange(redrawTexture);
-
-const fCam = gui.addFolder("Camera");
-fCam.add(CFG, "camX", -25, 25, 0.5).name("offset x");
-fCam.add(CFG, "camY", 3, 30, 0.5).name("offset y");
-fCam.add(CFG, "camZ", 4, 30, 0.5).name("offset z");
-fCam
-  .add(CFG, "fov", 20, 80, 1)
-  .name("fov")
-  .onChange((v) => {
-    camera.fov = v;
-    camera.updateProjectionMatrix();
-  });
-
-const actions = {
-  copyConfig() {
-    const json = JSON.stringify(CFG, null, 2);
-    const done = () => {
-      copyBtn.name("✓ copied!");
-      setTimeout(() => copyBtn.name("copy config"), 1200);
-    };
-    if (navigator.clipboard?.writeText) {
-      navigator.clipboard
-        .writeText(json)
-        .then(done)
-        .catch(() => {
-          fallbackCopy(json);
-          done();
-        });
-    } else {
-      fallbackCopy(json);
-      done();
-    }
-  },
-  resetRoll,
-};
-
-function fallbackCopy(text) {
-  const ta = document.createElement("textarea");
-  ta.value = text;
-  ta.style.position = "fixed";
-  ta.style.opacity = "0";
-  document.body.appendChild(ta);
-  ta.select();
-  document.execCommand("copy");
-  ta.remove();
-}
-
-const copyBtn = gui.add(actions, "copyConfig").name("copy config");
-gui.add(actions, "resetRoll").name("reset roll");
-
-/* ------------------------------------------------------------------ */
-/*  MAIN LOOP — constant roll speed                                    */
+/*  MAIN LOOP                                                          */
 /* ------------------------------------------------------------------ */
 const clock = new THREE.Clock();
 
-buildRollParts();
-resetRoll();
+pushSample(0, 0, 1, 0);
+updateRoll(s, updateStrip(s), 0);
 updateCamera();
 
 function tick() {
@@ -692,7 +579,7 @@ function tick() {
   const dt = Math.min(clock.getDelta(), 0.05);
 
   // the roll chases the pointer while dragging: speed scales with how far
-  // the pointer is (drag harder/farther = roll faster), easing in and out
+  // the pointer is (drag farther = roll faster)
   let targetVel = 0;
   if (dragging && seekValid && s < CFG.L) {
     const frac = s - pathLen;
@@ -706,21 +593,22 @@ function tick() {
       // steer toward a smoothed heading, never a snapped one
       const targetAng = Math.atan2(dz, dx);
       desiredTheta +=
-        shortAngle(targetAng - desiredTheta) * Math.min(1, dt * 16);
+        shortAngle(targetAng - desiredTheta) * (1 - Math.exp(-dt * CFG.steer));
       targetVel = Math.min((dist - CFG.deadzone) * CFG.follow, CFG.maxSpeed);
     }
   }
 
-  // velocity itself is eased, so starts and stops are soft
-  vel += (targetVel - vel) * Math.min(1, dt * 11);
-  if (vel > 0.01 && s < CFG.L) {
+  // asymmetric easing: picks up speed quickly, then coasts on release —
+  // let go and it keeps sliding for a while instead of stopping dead
+  const k = targetVel > vel ? CFG.accel : CFG.drag;
+  vel += (targetVel - vel) * (1 - Math.exp(-dt * k));
+  if (vel > 0.02 && s < CFG.L) {
     const prev = s;
     s = Math.min(s + vel * dt, CFG.L);
     advancePath(s);
-    currentR = updateStrip(s);
-    updateRoll(s, currentR, s - prev);
+    updateRoll(s, updateStrip(s), s - prev);
     if (s > S_MIN + 0.5) hint.classList.add("hidden");
-  } else if (vel <= 0.01) {
+  } else if (vel <= 0.02) {
     vel = 0;
   }
 
